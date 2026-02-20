@@ -7,8 +7,6 @@ services:
       POSTGRES_DB: altas_local
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
-    ports:
-      - "5432:5432"
     volumes:
       - altas_pg_data:/var/lib/postgresql/data
     healthcheck:
@@ -26,7 +24,7 @@ services:
       db:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@db:5432/altas_local?schema=public
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@db:5432/altas_local?schema=public&connection_limit=20&pool_timeout=120
       JWT_SECRET: ${JWT_SECRET:-change-this-in-production}
       PORT: 5000
       HOST: 0.0.0.0

@@ -22,6 +22,10 @@ FROM node:22.12-bookworm-slim AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 
+RUN apt-get update -y \
+  && apt-get install -y --no-install-recommends openssl ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
 COPY --from=backend-builder /app/backend /app/backend
 COPY --from=frontend-builder /app/frontend/dist /app/frontend/dist
 
