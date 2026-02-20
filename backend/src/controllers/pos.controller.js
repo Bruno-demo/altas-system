@@ -1,0 +1,363 @@
+// What this does: creates an invoice sale and deducts stock from the exact bin(s)
+const prisma = require("../prisma");
+const { handleError } = require("../utils/errors");
+
+// What this does: generates invoice number like ALT-2026-000001 (simple local approach)
+async function generateInvoiceNo(tx) {
+  const year = new Date().getFullYear();
+  const prefix = `ALT-${year}-`;
+
+  // Count sales in the year to generate next number
+  // Note: good enough for local single-machine; if multi-branch later we can improve.
+  const count = await tx.sale.count({
+    where: {
+      createdAt: {
+        gte: new Date(`${year}-01-01T00:00:00.000Z`),
+        lte: new Date(`${year}-12-31T23:59:59.999Z`),
+      },
+    },
+  });
+
+  const next = String(count + 1).padStart(6, "0");
+  return `${prefix}${next}`;
+}
+
+// -------------------------------
+// CREATE SALE
+// Body:
+// {
+//   "paymentMethod": "CASH",
+//   "note": "optional",
+//   "items": [
+//     { "productId": "...", "locationId": "...", "binId": "...", "quantity": 2, "unitPrice": 6000, "discount": 0 }
+//   ]
+// }
+// -------------------------------
+exports.createSale = async (req, res) => {
+  try {
+    const {
+      paymentMethod,
+      note,
+      items,
+      buyerType,
+      buyerTin,
+      buyerName,
+      buyerPhone,
+    } = req.body;
+
+    if (!paymentMethod) {
+      return res.status(400).json({ message: "paymentMethod is required" });
+    }
+
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ message: "items must be a non-empty array" });
+    }
+
+    const buyerTypeValue = buyerType ? String(buyerType).trim().toUpperCase() : null;
+    const buyerTinValue = buyerTin ? String(buyerTin).trim() : null;
+    const buyerNameValue = buyerName ? String(buyerName).trim() : null;
+    const buyerPhoneValue = buyerPhone ? String(buyerPhone).trim() : null;
+
+    if (buyerTypeValue && !["INDIVIDUAL", "COMPANY"].includes(buyerTypeValue)) {
+      return res.status(400).json({ message: "buyerType must be INDIVIDUAL or COMPANY" });
+    }
+    if (buyerTypeValue === "COMPANY" && !buyerTinValue) {
+      return res.status(400).json({ message: "buyerTin is required for COMPANY" });
+    }
+
+    // Validate items quick
+    for (const it of items) {
+      if (!it.productId || it.quantity == null || it.unitPrice == null) {
+        return res.status(400).json({
+          message: "Each item requires productId, quantity, unitPrice",
+        });
+      }
+      const qty = Number(it.quantity);
+      if (Number.isNaN(qty) || qty <= 0) return res.status(400).json({ message: "quantity must be > 0" });
+      const price = Number(it.unitPrice);
+      if (Number.isNaN(price) || price < 0) return res.status(400).json({ message: "unitPrice must be >= 0" });
+    }
+
+    const saleResult = await prisma.$transaction(async (tx) => {
+      // 1) generate invoice number
+      const invoiceNo = await generateInvoiceNo(tx);
+
+      // 2) Validate inventory availability per bin and compute totals
+      let subtotal = 0;
+      let discountTotal = 0;
+
+      // We'll store prepared items
+      const preparedItems = [];
+      let motorbikeLocationId = null;
+
+      const resolveMotorbikeLocationId = async () => {
+        if (motorbikeLocationId) return motorbikeLocationId;
+        const existing = await tx.location.findUnique({
+          where: { name: "MOTORBIKE-SALES" },
+        });
+        if (existing) {
+          motorbikeLocationId = existing.id;
+          return motorbikeLocationId;
+        }
+        const created = await tx.location.create({
+          data: { name: "MOTORBIKE-SALES" },
+        });
+        motorbikeLocationId = created.id;
+        return motorbikeLocationId;
+      };
+
+      for (const it of items) {
+        const qty = Number(it.quantity);
+        const unitPrice = Number(it.unitPrice);
+        const discount = it.discount != null ? Number(it.discount) : 0;
+
+        // Validate product exists
+        const product = await tx.product.findUnique({ where: { id: it.productId } });
+        if (!product) throw new Error("Product not found");
+
+        const isMotorbike = product.category === "Motorbike" || Boolean(product.chassisNumber);
+        const locationId = isMotorbike
+          ? await resolveMotorbikeLocationId()
+          : it.locationId;
+
+        if (!locationId) {
+          throw new Error("locationId is required for non-motorbike products");
+        }
+
+        let bin = null;
+        if (it.binId) {
+          bin = await tx.storageBin.findUnique({ where: { id: it.binId } });
+          if (!bin) throw new Error("Bin not found");
+          if (bin.locationId !== locationId) throw new Error("Bin does not belong to this location");
+        } else if (!isMotorbike) {
+          throw new Error("Bin is required for non-motorbike products");
+        }
+
+        const binCode = bin ? bin.code : "MOTORBIKE";
+
+        if (!isMotorbike) {
+          const inv = await tx.inventory.findUnique({
+            where: {
+              productId_locationId_binId: {
+                productId: it.productId,
+                locationId,
+                binId: it.binId,
+              },
+            },
+          });
+
+          if (!inv) {
+            throw new Error(`No inventory record for ${product.name} in bin ${bin.code}. Available=0`);
+          }
+          if (inv.quantity < qty) {
+            throw new Error(
+              `Not enough stock for ${product.name} in bin ${bin.code}. Requested=${qty}, Available=${inv.quantity}`
+            );
+          }
+        }
+
+        if (isMotorbike && unitPrice <= 0) {
+          throw new Error("Unit price must be greater than 0 for motorbike items.");
+        }
+
+        const lineGross = unitPrice * qty;
+        const lineNet = Math.max(lineGross - discount, 0);
+
+        subtotal += lineGross;
+        discountTotal += discount;
+
+        preparedItems.push({
+          productId: it.productId,
+          locationId,
+          binId: bin ? bin.id : null,
+          quantity: qty,
+          unitPrice: String(unitPrice),
+          discount: String(discount),
+          lineTotal: String(lineNet),
+          productName: product.name,
+          binCode,
+        });
+      }
+
+      const taxTotal = 0; // for now; later we can add VAT rules
+      const total = Math.max(subtotal - discountTotal + taxTotal, 0);
+
+      // What this does: ensures cashier has an OPEN shift and links the sale to that shift
+      const openShift = await tx.cashierShift.findFirst({
+        where: { cashierId: req.user.id, status: "OPEN" },
+        orderBy: { openedAt: "desc" },
+      });
+
+      if (!openShift) {
+        throw new Error("No OPEN shift. Please open shift before making sales.");
+      }
+      // 3) Create Sale + items
+      const sale = await tx.sale.create({
+        data: {
+          shiftId: openShift.id,
+          invoiceNo,
+          subtotal: String(subtotal),
+          discountTotal: String(discountTotal),
+          taxTotal: String(taxTotal),
+          total: String(total),
+          paymentMethod,
+          note: note ? String(note) : null,
+          buyerType: buyerTypeValue || undefined,
+          buyerTin: buyerTinValue || null,
+          buyerName: buyerNameValue || null,
+          buyerPhone: buyerPhoneValue || null,
+          cashierId: req.user.id,
+          items: {
+            create: preparedItems.map((p) => ({
+              productId: p.productId,
+              locationId: p.locationId,
+              binId: p.binId,
+              quantity: p.quantity,
+              unitPrice: p.unitPrice,
+              discount: p.discount,
+              lineTotal: p.lineTotal,
+            })),
+          },
+        },
+        include: {
+          items: true,
+        },
+      });
+
+
+      // 4) Deduct inventory per item (bin required)
+      for (const p of preparedItems) {
+        if (!p.binId) continue;
+
+        await tx.inventory.update({
+          where: {
+            productId_locationId_binId: {
+              productId: p.productId,
+              locationId: p.locationId,
+              binId: p.binId,
+            },
+          },
+          data: {
+            quantity: { decrement: p.quantity },
+          },
+        });
+
+        // Optional: log stock transaction OUT for audit/history
+        await tx.stockTransaction.create({
+          data: {
+            type: "OUT",
+            productId: p.productId,
+            locationId: p.locationId,
+            quantity: p.quantity,
+            reason: `SALE:${invoiceNo} | BIN:${p.binCode}`,
+            createdBy: req.user.id,
+          },
+        });
+      }
+
+      // 5) Audit log
+      await tx.auditLog.create({
+        data: {
+          userId: req.user.id,
+          action: "CREATE_SALE",
+          details: `Created sale ${invoiceNo} total=${total} method=${paymentMethod}`,
+        },
+      });
+
+      return sale;
+    });
+
+    return res.status(201).json(saleResult);
+  } catch (err) {
+    return handleError(res, err, { status: 400 });
+  }
+};
+
+
+// -------------------------------
+// LIST SALES
+// Query: ?from=2026-01-01&to=2026-01-31&page=1&limit=20
+// Cashier sees only their sales; Manager/CEO sees all.
+// -------------------------------
+exports.listSales = async (req, res) => {
+  try {
+    const { from, to, page = 1, limit = 20 } = req.query;
+
+    const take = Math.min(Number(limit) || 20, 100);
+    const skip = (Number(page) - 1) * take;
+
+    const where = {};
+
+    // Role-based filter
+    if (req.user.role === "CASHIER") {
+      where.cashierId = req.user.id;
+    }
+
+    if (from || to) {
+      where.createdAt = {};
+      if (from) where.createdAt.gte = new Date(from);
+      if (to) where.createdAt.lte = new Date(to);
+    }
+
+    const [total, sales] = await prisma.$transaction([
+      prisma.sale.count({ where }),
+      prisma.sale.findMany({
+        where,
+        orderBy: { createdAt: "desc" },
+        skip,
+        take,
+        include: {
+          cashier: { select: { id: true, fullName: true, role: true } },
+          items: {
+            include: {
+              product: { select: { id: true, name: true, sku: true, partNumber: true } },
+              bin: { select: { id: true, code: true } },
+              location: { select: { id: true, name: true } },
+            },
+          },
+        },
+      }),
+    ]);
+
+    return res.json({
+      meta: { total, page: Number(page), limit: take, pages: Math.ceil(total / take) },
+      sales,
+    });
+  } catch (err) {
+    return handleError(res, err, { status: 500 });
+  }
+};
+
+// -------------------------------
+// GET SALE BY ID
+// Cashier can view their own sale only.
+// -------------------------------
+exports.getSaleById = async (req, res) => {
+  try {
+    const sale = await prisma.sale.findUnique({
+      where: { id: req.params.id },
+      include: {
+        cashier: { select: { id: true, fullName: true, role: true } },
+        items: {
+          include: {
+            product: { select: { id: true, name: true, sku: true, partNumber: true } },
+            bin: { select: { id: true, code: true } },
+            location: { select: { id: true, name: true } },
+          },
+        },
+      },
+    });
+
+    if (!sale) return res.status(404).json({ message: "Sale not found" });
+
+    if (req.user.role === "CASHIER" && sale.cashierId !== req.user.id) {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    return res.json(sale);
+  } catch (err) {
+    return handleError(res, err, { status: 500 });
+  }
+};
+
+

@@ -1,0 +1,44 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: altas-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: altas_local
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    ports:
+      - "5432:5432"
+    volumes:
+      - altas_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d altas_local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  app:
+    container_name: altas-app
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@db:5432/altas_local?schema=public
+      JWT_SECRET: ${JWT_SECRET:-change-this-in-production}
+      PORT: 5000
+      HOST: 0.0.0.0
+      NODE_ENV: production
+      ERROR_LOG_DIR: /app/backend/logs/errors
+      ERROR_LOG_RETENTION_DAYS: ${ERROR_LOG_RETENTION_DAYS:-30}
+    ports:
+      - "${APP_PORT:-5000}:5000"
+    volumes:
+      - altas_app_logs:/app/backend/logs
+    restart: unless-stopped
+
+volumes:
+  altas_pg_data:
+  altas_app_logs:

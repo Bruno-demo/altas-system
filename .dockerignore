@@ -1,0 +1,17 @@
+.git
+.gitignore
+**/.git
+**/node_modules
+**/dist
+**/.DS_Store
+**/Thumbs.db
+
+# Local runtime/output artifacts
+backend/logs
+backend/.env
+backend/src/prisma/.env
+frontend/src/.env
+
+# Docs/binaries not needed for container build
+docs/*.pdf
+docs/*.pptx
